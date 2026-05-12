@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import functools
 import json
 import os
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal, TypeVar
 
@@ -16,6 +17,7 @@ from ._core.runtime import (
     build_detection_summary,
     load_inference_runtime,
     predict_text,
+    predict_texts,
 )
 
 
@@ -272,6 +274,68 @@ class OPF:
             redacted_text=redacted_text,
             warning=_warning_for_prediction(prediction),
         )
+
+    def redact_many(
+        self,
+        texts: Sequence[str],
+        *,
+        decode: DecodeOptions | None = None,
+        max_tokens_per_forward: int = 16384,
+    ) -> list[str] | list[RedactionResult]:
+        """Run redaction on a batch of input strings in shared forward passes.
+
+        Equivalent to calling :meth:`redact` on each text individually, but
+        windows from multiple inputs share one or more batched
+        ``model.forward()`` calls — useful when serving concurrent requests
+        on the same instance.
+
+        Args:
+            texts: Input strings to redact.
+            decode: Optional per-call decode overrides shared across the batch.
+            max_tokens_per_forward: Bin-pack target (``rows * max_seq``) for
+                batched forward passes. A single window longer than this value
+                still runs by itself.
+
+        Returns:
+            One result per input text in input order. Type matches the
+            return shape of :meth:`redact` based on ``output_text_only``.
+        """
+        if isinstance(texts, str):
+            raise TypeError("texts must be a sequence of strings, not a single string")
+        texts_list = list(texts)
+        if any(not isinstance(text, str) for text in texts_list):
+            raise TypeError("texts must contain only strings")
+        if max_tokens_per_forward <= 0:
+            raise ValueError("max_tokens_per_forward must be positive")
+        if not texts_list:
+            return []
+        runtime, decoder = self.get_prediction_components(decode=decode)
+        predictions = predict_texts(
+            runtime,
+            texts_list,
+            decoder=decoder,
+            max_tokens_per_forward=max_tokens_per_forward,
+        )
+        if self._output_text_only:
+            return [
+                _redact_text(prediction.text, prediction.spans)
+                for prediction in predictions
+            ]
+        return [
+            RedactionResult(
+                schema_version=SCHEMA_VERSION,
+                summary=build_detection_summary(
+                    output_mode=runtime.output_mode,
+                    labels=[span.label for span in prediction.spans],
+                    decoded_mismatch=prediction.decoded_mismatch,
+                ),
+                text=prediction.text,
+                detected_spans=tuple(prediction.spans),
+                redacted_text=_redact_text(prediction.text, prediction.spans),
+                warning=_warning_for_prediction(prediction),
+            )
+            for prediction in predictions
+        ]
 
     def set_model_path(self, model_path: str | os.PathLike[str]) -> OPF:
         """Update the checkpoint directory used by this redactor.
