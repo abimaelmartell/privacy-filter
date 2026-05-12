@@ -7,6 +7,13 @@ import triton
 import triton.language as tl
 
 
+_TORCH_TO_TL_DTYPE: dict[torch.dtype, "tl.dtype"] = {
+    torch.bfloat16: tl.bfloat16,
+    torch.float16: tl.float16,
+    torch.float32: tl.float32,
+}
+
+
 @triton.jit
 def _grouped_matmul_kernel(
     a_ptr,
@@ -167,6 +174,7 @@ def _grouped_swiglu_w2_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    W_DTYPE: tl.constexpr,
 ):
     """Triton kernel for grouped SwiGLU-output projection tiles."""
     pid_m = tl.program_id(0)
@@ -219,7 +227,9 @@ def _grouped_swiglu_w2_kernel(
         h_glu_f = h_glu.to(tl.float32)
         h_lin_f = h_lin.to(tl.float32)
         act = h_glu_f * tl.sigmoid(ALPHA * h_glu_f) * (h_lin_f + 1.0)
-        act = act.to(h_glu.dtype)
+        # tl.dot requires matching input dtypes. The SwiGLU math is computed in
+        # fp32 for stability, then cast back to the projection weight dtype.
+        act = act.to(W_DTYPE)
 
         w_ptrs = (
             w_ptr
@@ -268,6 +278,12 @@ def grouped_swiglu_w2(
         raise ValueError(
             f"grouped_swiglu_w2 shape mismatch: h{tuple(h_pre.shape)} w{tuple(weights.shape)}"
         )
+    try:
+        w_dtype_tl = _TORCH_TO_TL_DTYPE[weights.dtype]
+    except KeyError as exc:
+        raise ValueError(
+            f"grouped_swiglu_w2 unsupported weights dtype: {weights.dtype}"
+        ) from exc
     if out_dtype is None:
         out_dtype = torch.float32
     c = torch.empty((h_pre.shape[0], N), device=h_pre.device, dtype=out_dtype)
@@ -310,6 +326,7 @@ def grouped_swiglu_w2(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        W_DTYPE=w_dtype_tl,
         num_warps=num_warps,
         num_stages=num_stages,
     )
